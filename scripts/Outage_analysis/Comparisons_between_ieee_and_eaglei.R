@@ -85,7 +85,7 @@ counties_NERCs <- st_read(counties_nerc_shp_path) %>%
   mutate(fips_code = as.numeric(GEOID)) # Create fips_code column for joining
 
 # Get county centroids for faster spatial join with time zone shapefile
-counties_NERCs_sub <- st_centroid(counties_NERCs_sub)
+counties_NERCs <- st_centroid(counties_NERCs)
 
 # Read in time zone shapefile
 time_zone <- st_read(time_zone_shp_path) %>%
@@ -93,17 +93,17 @@ time_zone <- st_read(time_zone_shp_path) %>%
   st_make_valid() # Fix any invalid geometries
 
 # Spatial join to assign time zones
-counties_NERCs_sub <- st_join(counties_NERCs_sub, time_zone, join = st_intersects)
+counties_NERCs <- st_join(counties_NERCs, time_zone, join = st_intersects)
 
 # There are two counties that are not handled by this spatial join. Manually assign the time zone
-counties_NERCs_sub[counties_NERCs_sub$GEOID == "12087", "zone"] <- "Eastern"
-counties_NERCs_sub[counties_NERCs_sub$GEOID == "12087", "utc"] <- "-05:00"
+counties_NERCs[counties_NERCs$GEOID == "12087", "zone"] <- "Eastern"
+counties_NERCs[counties_NERCs$GEOID == "12087", "utc"] <- "-05:00"
 
-counties_NERCs_sub[counties_NERCs_sub$GEOID == "06075", "zone"] <- "Pacific"
-counties_NERCs_sub[counties_NERCs_sub$GEOID == "06075", "utc"] <- "-08:00"
+counties_NERCs[counties_NERCs$GEOID == "06075", "zone"] <- "Pacific"
+counties_NERCs[counties_NERCs$GEOID == "06075", "utc"] <- "-08:00"
 
 # Drop geometry
-counties_NERCs_sub <- st_drop_geometry(counties_NERCs_sub)
+counties_NERCs <- st_drop_geometry(counties_NERCs)
 
 
 # 2. Load and Pre-process EAGLE-I Raw Data ----
@@ -125,27 +125,31 @@ eaglei_list <- lapply(eaglei_file_paths, fread)
 eaglei_all <- rbindlist(eaglei_list)
 
 # Join time zone info to EAGLE-I data
-eaglei_all <- merge(eaglei_all, counties_NERCs_sub[, c("fips_code", "zone")])
+eaglei_all <- merge(eaglei_all, counties_NERCs[, c("fips_code", "zone")])
 
+# Map simplified time zone names to IANA time zone identifiers
+tz_mapping <- data.frame(
+  zone = c("Eastern", "Central", "Mountain", "Pacific"),
+  tz = c("America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles")
+)
 
-
-
-
-# Map simplified time zone names to IANA time zone identifiers and adjust for Arizona
+# Adjust the UTC time to local time for each county
+# Handle Arizona counties (Mountain Time, no DST except Navajo Nation)
+arizona_counties <- c(
+  "4001", "4003", "4005", "4007", "4009", "4011", "4012",
+  "4013", "4015", "4017", "4019", "4021", "4023", "4025", "4027"
+) # All AZ FIPS codes
 eaglei_all <- eaglei_all %>%
   mutate(
-    tz_to_apply = case_when(
-      fips_code %in% arizona_fips_codes & fips_code != navajo_nation_fips & zone == "Mountain" ~ "America/Phoenix", # No DST
-      fips_code == navajo_nation_fips & zone == "Mountain" ~ "America/Denver", # Navajo Nation uses DST
-      TRUE ~ iana_tz_map[zone] # Default to mapped IANA TZ
+    tz = case_when(
+      fips_code %in% arizona_counties & fips_code != "4017" & zone == "Mountain" ~ "America/Phoenix", # No DST
+      fips_code == "4017" & zone == "Mountain" ~ "America/Denver", # Navajo Nation uses DST
+      TRUE ~ tz_mapping$tz[match(zone, tz_mapping$zone)]
     )
   )
 
-# Convert `run_start_time` to POSIXct object first
-eaglei_all$run_start_time <- ymd_hms(eaglei_all$run_start_time, tz = "UTC")
-
-# Adjust the UTC time to local time for each county
-eaglei_all[, local_time := with_tz(run_start_time, tzone = tz_to_apply), by = .(fips_code)]
+# Convert to local time
+eaglei_all[, local_time := with_tz(run_start_time, tz), by = .(fips_code, tz)]
 
 # Rename columns for compatibility with aggregation functions
 # The aggregation functions expect `run_start_time` to be the local time.
@@ -177,49 +181,24 @@ eaglei_daily <- eaglei_daily %>%
   ) %>%
   arrange(fips_code, Date)
 
-# Remove the first and last days of the overall period for which 3-day moving averages
-# might be incomplete or inaccurate due to boundary conditions.
-# The `aggregate_by_sum_positive_diff` already handles `rollmean` `fill=NA`, so this
-# is more about removing incomplete daily windows from the entire dataset boundary.
-# The original script had specific dates "2014-11-01", "2022-11-12".
-# This should be dynamic based on the actual min/max dates after aggregation.
-min_date_for_avg <- min(eaglei_daily$Date, na.rm = TRUE) + 1 # First valid day for 3-day avg center
-max_date_for_avg <- max(eaglei_daily$Date, na.rm = TRUE) - 1 # Last valid day for 3-day avg center
-eaglei_daily <- eaglei_daily[eaglei_daily$Date >= min_date_for_avg & eaglei_daily$Date <= max_date_for_avg, ]
+# Remove the first day (2014-11-01) and the last day (2022-11-12) as 3-day moving average will not work
+eaglei_daily <- eaglei_daily[!eaglei_daily$Date %in% c("2014-11-01", "2022-11-12"), ]
 
-# Join county-NERC info to EAGLE-I daily data
-eaglei_daily <- merge(eaglei_daily, counties_tz_info[, c("fips_code", "NERC")], by = "fips_code", all.x = FALSE)
+# Join county-NERC info to EAGLE-I
+eaglei_daily <- merge(eaglei_daily, counties_NERCs_sub[, c("fips_code", "NERC")], by = "fips_code")
 
-# Convert to data.table for efficient NERC-level aggregation
-eaglei_daily_dt <- as.data.table(eaglei_daily)
+# Convert to data table
+eaglei_daily <- as.data.table(eaglei_daily)
 
 # Aggregate to NERC region-level
-eaglei_NERC_aggregated <- eaglei_daily_dt[, .(
-  max_customer = sum(max_customer, na.rm = TRUE),
-  daily_ci = sum(daily_ci, na.rm = TRUE),
-  daily_ci_3day_avg = sum(daily_ci_3day_avg, na.rm = TRUE),
-  customer_minutes = sum(total_customer_minutes, na.rm = TRUE)
-), by = .(NERC, Date)]
+eaglei_NERC <- eaglei_daily[, .(max_customer = sum(max_customer, na.rm = TRUE),
+                                daily_ci = sum(daily_ci, na.rm = TRUE),
+                                daily_ci_3day_avg = sum(daily_ci_3day_avg, na.rm = TRUE),
+                                customer_minutes = sum(total_customer_minutes, na.rm = TRUE)),
+                            by = .(NERC, Date)]
 
-# Remove NERC regions that might be NA if some counties couldn't be mapped
-eaglei_NERC_aggregated <- eaglei_NERC_aggregated[!is.na(NERC)]
-
-# Optional: Write out the aggregated NERC-level EAGLE-I data
-if (!is.null(eaglei_nerc_output_path)) {
-  # Ensure the output directory exists
-  output_dir <- dirname(eaglei_nerc_output_path)
-  if (!dir.exists(output_dir)) {
-    dir.create(output_dir, recursive = TRUE)
-  }
-  fwrite(eaglei_NERC_aggregated, eaglei_nerc_output_path)
-  message(paste0("Aggregated EAGLE-I NERC data saved to: ", eaglei_nerc_output_path))
-} else {
-  message("Skipping saving aggregated EAGLE-I NERC data (eaglei_nerc_output_path not defined).")
-}
-
-# Read back for consistency (if saved and re-read is desired, otherwise use eaglei_NERC_aggregated directly)
-# This assumes the file structure on disk is consistent.
-eaglei_combined_NERC <- fread(eaglei_nerc_output_path)
+# # Write out the NERC-level EAGLE-I with time adjusted to local time
+# fwrite(eaglei_NERC, eaglei_nerc_time_adjusted_path)
 
 
 # 4. Load and Prepare IEEE Dataset ----
@@ -231,9 +210,7 @@ IEEE_combined <- fread(ieee_combined_path)
 # Rename "SPP RE" to "SPP" for consistency
 IEEE_combined[IEEE_combined$NERC == "SPP RE", "NERC"] <- "SPP"
 
-# Aggregate to NERC level (if not already fully aggregated, and ensure correct column names)
-# The `combined.csv` is usually already aggregated to NERC level, so this might be redundant
-# but ensures summing if there are any finer-grained records.
+# Aggregate to NERC level 
 IEEE_combined_NERC <- IEEE_combined[, .(CI = sum(CI, na.rm = TRUE), CMI = sum(CMI, na.rm = TRUE)),
                                     by = .(NERC, Date)]
 
@@ -252,7 +229,7 @@ IEEE_combined_NERC <- IEEE_combined_NERC[!is.na(IEEE_combined_NERC$CI_moving), ]
 IEEE_combined_NERC$year <- year(IEEE_combined_NERC$Date)
 
 # Read in IEEE customer data
-IEEE_customer <- fread(ieee_customer_path)
+IEEE_customer <- fread(ieee_customers_path)
 
 # Rename "SPP RE" to "SPP" for consistency
 IEEE_customer[IEEE_customer$NERC == "SPP RE", "NERC"] <- "SPP"
@@ -268,285 +245,293 @@ IEEE_combined_NERC <- merge(IEEE_combined_NERC, IEEE_customer_NERC,
 # 5. Merge EAGLE-I and IEEE Datasets ----
 message("5. Merging EAGLE-I and IEEE datasets for comparison...")
 
-# Merge the two datasets on NERC and Date
-Merged_data <- merge(IEEE_combined_NERC, eaglei_combined_NERC,
-                     by = c("NERC", "Date"), all.x = TRUE, all.y = TRUE)
+# Merge the two datasets 
+Merged <- merge(IEEE_combined_NERC, eaglei_combined_NERC, by = c("NERC", "Date"), all.x = TRUE, all.y = TRUE)
 
 # Calculate the customers impacted percentage
-Merged_data$CI_per <- Merged_data$CI / Merged_data$customers_IEEE * 100
+Merged$CI_per <- Merged$CI / Merged$customers_IEEE * 100
 
-# Extract records with overlapping time period defined in config.R
-Merged_data_filtered <- Merged_data[
-  Merged_data$Date >= analysis_start_date & Merged_data$Date <= analysis_end_date,
-]
+# Extract records with overlapping time period
+Merged_2018_2022 <- Merged[Merged$Date >= "2018-01-01" & Merged$Date <= "2022-11-11", ]
 
-# Obtain records with both valid CI metrics from IEEE and EAGLE-I
-valid_comparison_data <- Merged_data_filtered[
-  !is.na(Merged_data_filtered$CI) & !is.na(Merged_data_filtered$daily_ci_3day_avg),
-]
+# Obtain records with both valid records
+valid_2018_2022 <- Merged_2018_2022[!is.na(Merged_2018_2022$CI) & !is.na(Merged_2018_2022$daily_ci_3day_avg), ]
 
-
-# 6. Initial Exploration and Filtering ----
-message("6. Exploring and filtering data...")
-
-# Explore CI_per distribution
-breaks_ci_per <- c(0, 0.25, 0.5, 1, 2, 5, 10, 20, 100, Inf) # Added Inf for the last bin
-valid_comparison_data$CI_per_Range <- cut(valid_comparison_data$CI_per,
-                                          breaks = breaks_ci_per,
-                                          right = TRUE, include.lowest = TRUE)
-message("\nDistribution of CI_per ranges:")
-print(table(valid_comparison_data$CI_per_Range))
-
-# Histogram of CI_per
-hist(valid_comparison_data$CI_per, breaks = 1000, xlim = c(0, 10),
-     xlab = "Percent of Customer Impact (CI)",
+# Explore CI_per
+breaks = c(0, 0.25, 0.5, 1, 2, 5, 10, 20, 100, 200)
+valid_2018_2022$Range <- cut(valid_2018_2022$CI_per, breaks = breaks, right = TRUE, include.lowest = TRUE)
+table(valid_2018_2022$Range)
+hist(valid_2018_2022$CI_per, breaks = 1000, xlim = c(0, 10), xlab = "Percent of CI", 
      main = "Histogram of Percent of CI (2018 - 2022)")
 
-# Filter the data by removing low CI% based on `min_ci_percentage_filter` from config.R
-valid_comparison_data <- valid_comparison_data[valid_comparison_data$CI_per > min_ci_percentage_filter, ]
-message(paste0("Filtered data to include only records with CI_per > ", min_ci_percentage_filter, "%"))
+# Filter the data frame by removing low CI%
+valid_2018_2022 <- valid_2018_2022[valid_2018_2022$CI_per > 0.25, ]
 
 
-# 7. Correlation Analysis ----
-message("\n7. Performing correlation analysis...")
+# Pearson's correlation coefficient between the two datasets
+cor(valid_2018_2022$CI, valid_2018_2022$max_customer)
+cor(valid_2018_2022$CMI, valid_2018_2022$customer_minutes)
+cor(valid_2018_2022$CI, valid_2018_2022$daily_ci)
+cor(valid_2018_2022$CI, valid_2018_2022$daily_ci_3day_avg)
+cor(valid_2018_2022$CI_moving, valid_2018_2022$daily_ci_3day_avg)
 
-message("\nPearson's correlation coefficients:")
-message(paste0("  CI (IEEE) vs. max_customer (EAGLE-I): ", round(cor(valid_comparison_data$CI, valid_comparison_data$max_customer, use = "pairwise.complete.obs"), 3)))
-message(paste0("  CMI (IEEE) vs. customer_minutes (EAGLE-I): ", round(cor(valid_comparison_data$CMI, valid_comparison_data$customer_minutes, use = "pairwise.complete.obs"), 3)))
-message(paste0("  CI (IEEE) vs. daily_ci (EAGLE-I): ", round(cor(valid_comparison_data$CI, valid_comparison_data$daily_ci, use = "pairwise.complete.obs"), 3)))
-message(paste0("  CI (IEEE) vs. daily_ci_3day_avg (EAGLE-I): ", round(cor(valid_comparison_data$CI, valid_comparison_data$daily_ci_3day_avg, use = "pairwise.complete.obs"), 3)))
-message(paste0("  CI_moving (IEEE) vs. daily_ci_3day_avg (EAGLE-I): ", round(cor(valid_comparison_data$CI_moving, valid_comparison_data$daily_ci_3day_avg, use = "pairwise.complete.obs"), 3)))
+# Spearman's rank correlation coefficient between the two datasets
+cor(valid_2018_2022$CI, valid_2018_2022$max_customer, method = "spearman")
+cor(valid_2018_2022$CMI, valid_2018_2022$customer_minutes, method = "spearman")
+cor(valid_2018_2022$CI, valid_2018_2022$daily_ci, method = "spearman")
+cor(valid_2018_2022$CI, valid_2018_2022$daily_ci_3day_avg, method = "spearman")
+cor(valid_2018_2022$CI_moving, valid_2018_2022$daily_ci_3day_avg, method = "spearman")
 
-message("\nSpearman's rank correlation coefficients:")
-message(paste0("  CI (IEEE) vs. max_customer (EAGLE-I): ", round(cor(valid_comparison_data$CI, valid_comparison_data$max_customer, method = "spearman", use = "pairwise.complete.obs"), 3)))
-message(paste0("  CMI (IEEE) vs. customer_minutes (EAGLE-I): ", round(cor(valid_comparison_data$CMI, valid_comparison_data$customer_minutes, method = "spearman", use = "pairwise.complete.obs"), 3)))
-message(paste0("  CI (IEEE) vs. daily_ci (EAGLE-I): ", round(cor(valid_comparison_data$CI, valid_comparison_data$daily_ci, method = "spearman", use = "pairwise.complete.obs"), 3)))
-message(paste0("  CI (IEEE) vs. daily_ci_3day_avg (EAGLE-I): ", round(cor(valid_comparison_data$CI, valid_comparison_data$daily_ci_3day_avg, method = "spearman", use = "pairwise.complete.obs"), 3)))
-message(paste0("  CI_moving (IEEE) vs. daily_ci_3day_avg (EAGLE-I): ", round(cor(valid_comparison_data$CI_moving, valid_comparison_data$daily_ci_3day_avg, method = "spearman", use = "pairwise.complete.obs"), 3)))
+# Comparison between the aggregation methods
+plot(valid_2018_2022$max_customer/1000, valid_2018_2022$daily_ci/1000,
+     xlab = "Daily max (in thousands)",
+     ylab = "Sum_positive_diff (in thousands)",
+     # xlim = c(0, 9000),
+     # ylim = c(0, 9000),
+     col = as.factor(valid_2018_2022$NERC),
+     main = "CI comparison for all NERC regions by aggregation method")
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+legend("topright", legend = unique(as.factor(valid_2018_2022$NERC)), 
+       col = unique(as.factor(valid_2018_2022$NERC)), pch = 1, title = "NERC Regions")
+
+boxplot(log(valid_2018_2022$max_customer), 
+        log(valid_2018_2022$daily_ci), 
+        log(valid_2018_2022$daily_ci_3day_avg),
+        names = c("EAGLE-I_daily_max", "EAGLE-I_sum_positive_diff", "EAGLE-I_Moving_avg"), 
+        ylab = "Log (CI)", 
+        las = 1)
 
 
-# 8. Visualization of Comparisons (All NERC Regions) ----
-message("\n8. Generating visualizations for all NERC regions...")
-
-# Convert NERC column to factor for consistent plotting colors
-valid_comparison_data$NERC_factor <- as.factor(valid_comparison_data$NERC)
-valid_comparison_data$year_factor <- as.factor(valid_comparison_data$year)
-
-# Comparison between EAGLE-I aggregation methods (Daily Max vs. Sum Positive Diff)
-plot(valid_comparison_data$max_customer / 1000, valid_comparison_data$daily_ci / 1000,
-     xlab = "EAGLE-I Daily Max CI (in thousands)",
-     ylab = "EAGLE-I Sum of Positive Diff CI (in thousands)",
-     main = "EAGLE-I CI Comparison by Aggregation Method (All NERC)",
-     col = valid_comparison_data$NERC_factor,
-     pch = 19, cex = 0.8)
-abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-legend("topleft", legend = levels(valid_comparison_data$NERC_factor),
-       col = unique(valid_comparison_data$NERC_factor), pch = 19, title = "NERC Regions",
-       cex = 0.7, bty = "n")
-
-# Boxplot of Log(CI) for different EAGLE-I aggregation methods
-boxplot(log(valid_comparison_data$max_customer + 1), # Add 1 to handle 0 values for log
-        log(valid_comparison_data$daily_ci + 1),
-        log(valid_comparison_data$daily_ci_3day_avg + 1),
-        names = c("EAGLE-I_daily_max", "EAGLE-I_sum_positive_diff", "EAGLE-I_Moving_avg"),
-        ylab = "Log(Customer Impact + 1)",
-        main = "Distribution of Log(CI) by EAGLE-I Aggregation Method",
-        las = 1, cex.axis = 0.8)
-
-# (IEEE CI vs. EAGLE-I Daily Max)
-plot(valid_comparison_data$CI / 1000, valid_comparison_data$max_customer / 1000,
+## Compare the two outage datasets for all NERC regions
+# (IEEE CI v.s. daily max)
+plot(valid_2018_2022$CI/1000, valid_2018_2022$max_customer/1000,
      xlab = "IEEE CI (in thousands)",
-     ylab = "EAGLE-I Daily Max CI (in thousands)",
-     xlim = c(0, max(valid_comparison_data$CI, valid_comparison_data$max_customer, na.rm = TRUE) / 1000),
-     ylim = c(0, max(valid_comparison_data$CI, valid_comparison_data$max_customer, na.rm = TRUE) / 1000),
-     col = valid_comparison_data$NERC_factor,
-     main = "CI Comparison: IEEE vs. EAGLE-I Daily Max (All NERC)",
-     cex.main = 1.5, cex.lab = 1.2, pch = 19, cex = 0.8)
-abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-legend("topleft", legend = levels(valid_comparison_data$NERC_factor),
-       col = unique(valid_comparison_data$NERC_factor), pch = 19, title = "NERC Regions",
-       cex = 0.7, bty = "n")
+     ylab = "EAGLE-I CI-daily_max (in thousands)",
+     xlim = c(0, 4000),
+     ylim = c(0, 4000),
+     col = as.factor(valid_2018_2022$NERC),
+     main = "CI comparison for all NERC regions",
+     cex.main = 2,
+     cex.lab = 1.5)
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+legend("topright", legend = unique(as.factor(valid_2018_2022$NERC)), 
+       col = unique(as.factor(valid_2018_2022$NERC)), pch = 1, title = "NERC Regions")
+boxplot(log(valid_2018_2022$CI), log(valid_2018_2022$CI_moving), 
+        log(valid_2018_2022$max_customer), log(valid_2018_2022$daily_ci), 
+        log(valid_2018_2022$daily_ci_3day_avg),
+        names = c("IEEE", "IEEE_moving_avg", "EAGLE-I_daily_max", "EAGLE-I_sum_positive_diff", 
+                  "EAGLE-I_Moving_avg"), 
+        # ylim = c(0, 16),
+        ylab = "Log (CI)", 
+        las = 1)
 
-# Boxplot of Log(CI) for IEEE vs. EAGLE-I aggregation methods
-boxplot(log(valid_comparison_data$CI + 1), log(valid_comparison_data$CI_moving + 1),
-        log(valid_comparison_data$max_customer + 1), log(valid_comparison_data$daily_ci + 1),
-        log(valid_comparison_data$daily_ci_3day_avg + 1),
-        names = c("IEEE", "IEEE_moving_avg", "EAGLE-I_daily_max", "EAGLE-I_sum_positive_diff",
-                  "EAGLE-I_Moving_avg"),
-        ylab = "Log(Customer Impact + 1)",
-        main = "Distribution of Log(CI) Across All Metrics",
-        las = 2, cex.axis = 0.8) # las=2 for vertical labels
-
-# (IEEE CI vs. EAGLE-I Sum Positive Diff)
-plot(valid_comparison_data$CI / 1000, valid_comparison_data$daily_ci / 1000,
+# (IEEE CI v.s sum_positive_diff)
+plot(valid_2018_2022$CI/1000, valid_2018_2022$daily_ci/1000,
      xlab = "IEEE CI (in thousands)",
-     ylab = "EAGLE-I Sum of Positive Diff CI (in thousands)",
-     xlim = c(0, max(valid_comparison_data$CI, valid_comparison_data$daily_ci, na.rm = TRUE) / 1000),
-     ylim = c(0, max(valid_comparison_data$CI, valid_comparison_data$daily_ci, na.rm = TRUE) / 1000),
-     col = valid_comparison_data$NERC_factor,
-     main = "CI Comparison: IEEE vs. EAGLE-I Sum Positive Diff (All NERC)",
-     cex.main = 1.5, cex.lab = 1.2, pch = 19, cex = 0.8)
-abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-legend("topleft", legend = levels(valid_comparison_data$NERC_factor),
-       col = unique(valid_comparison_data$NERC_factor), pch = 19, title = "NERC Regions",
-       cex = 0.7, bty = "n")
+     ylab = "EAGLE-I CI-sum_diff (in thousands)",
+     xlim = c(0, 8500),
+     ylim = c(0, 8500),
+     col = as.factor(valid_2018_2022$NERC),
+     main = "CI comparison for all NERC regions", 
+     cex.main = 2, 
+     cex.lab = 1.5)
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+legend("topright", legend = unique(as.factor(valid_2018_2022$NERC)), 
+       col = unique(as.factor(valid_2018_2022$NERC)), pch = 1, title = "NERC Regions")
 
-# (IEEE CI vs. EAGLE-I 3-day Moving Avg)
-plot(valid_comparison_data$CI / 1000, valid_comparison_data$daily_ci_3day_avg / 1000,
+# (IEEE CI v.s moving avg)
+plot(valid_2018_2022$CI/1000, valid_2018_2022$daily_ci_3day_avg/1000,
      xlab = "IEEE CI (in thousands)",
-     ylab = "EAGLE-I 3-day Moving Average CI (in thousands)",
-     xlim = c(0, max(valid_comparison_data$CI, valid_comparison_data$daily_ci_3day_avg, na.rm = TRUE) / 1000),
-     ylim = c(0, max(valid_comparison_data$CI, valid_comparison_data$daily_ci_3day_avg, na.rm = TRUE) / 1000),
-     col = valid_comparison_data$NERC_factor,
-     main = "CI Comparison: IEEE vs. EAGLE-I 3-day MA (All NERC)",
-     cex.main = 1.5, cex.lab = 1.2, pch = 19, cex = 0.8)
-abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-legend("topleft", legend = levels(valid_comparison_data$NERC_factor),
-       col = unique(valid_comparison_data$NERC_factor), pch = 19, title = "NERC Regions",
-       cex = 0.7, bty = "n")
+     ylab = "EAGLE-I CI-moving_avg (in thousands)",
+     xlim = c(0, 7000),
+     ylim = c(0, 7000),
+     col = as.factor(valid_2018_2022$NERC),
+     main = "CI comparison for all NERC regions", 
+     cex.main = 2, 
+     cex.lab = 1.5)
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+legend("topright", legend = unique(as.factor(valid_2018_2022$NERC)), 
+       col = unique(as.factor(valid_2018_2022$NERC)), pch = 1, title = "NERC Regions")
 
-# (IEEE 3-day Moving Avg vs. EAGLE-I 3-day Moving Avg)
-plot(valid_comparison_data$CI_moving / 1000, valid_comparison_data$daily_ci_3day_avg / 1000,
-     xlab = "IEEE 3-day Moving Average CI (in thousands)",
-     ylab = "EAGLE-I 3-day Moving Average CI (in thousands)",
-     xlim = c(0, max(valid_comparison_data$CI_moving, valid_comparison_data$daily_ci_3day_avg, na.rm = TRUE) / 1000),
-     ylim = c(0, max(valid_comparison_data$CI_moving, valid_comparison_data$daily_ci_3day_avg, na.rm = TRUE) / 1000),
-     col = valid_comparison_data$NERC_factor,
-     main = "CI Comparison: IEEE 3-day MA vs. EAGLE-I 3-day MA (All NERC)",
-     cex.main = 1.5, cex.lab = 1.2, pch = 19, cex = 0.8)
-abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-legend("topleft", legend = levels(valid_comparison_data$NERC_factor),
-       col = unique(valid_comparison_data$NERC_factor), pch = 19, title = "NERC Regions",
-       cex = 0.7, bty = "n")
+# (IEEE CI moving v.s moving avg)
+plot(valid_2018_2022$CI_moving/1000, valid_2018_2022$daily_ci_3day_avg/1000,
+     xlab = "IEEE CI-moving_avg (in thousands)",
+     ylab = "EAGLE-I CI-moving_avg (in thousands)",
+     xlim = c(0, 7000),
+     ylim = c(0, 7000),
+     col = as.factor(valid_2018_2022$NERC),
+     main = "CI comparison for all NERC regions")
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+legend("topright", legend = unique(as.factor(valid_2018_2022$NERC)), 
+       col = unique(as.factor(valid_2018_2022$NERC)), pch = 1, title = "NERC Regions")
 
 # (CMI comparisons)
-plot(valid_comparison_data$CMI / 1000000, valid_comparison_data$customer_minutes / 1000000,
-     xlab = "IEEE CMI (in millions)",
-     ylab = "EAGLE-I CMI (in millions)",
-     xlim = c(0, max(valid_comparison_data$CMI, valid_comparison_data$customer_minutes, na.rm = TRUE) / 1000000),
-     ylim = c(0, max(valid_comparison_data$CMI, valid_comparison_data$customer_minutes, na.rm = TRUE) / 1000000),
-     col = valid_comparison_data$NERC_factor,
-     main = "CMI Comparison: IEEE vs. EAGLE-I (All NERC)",
-     cex.main = 1.5, cex.lab = 1.2, pch = 19, cex = 0.8)
-abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-legend("topleft", legend = levels(valid_comparison_data$NERC_factor),
-       col = unique(valid_comparison_data$NERC_factor), pch = 19, title = "NERC Regions",
-       cex = 0.7, bty = "n")
+plot(valid_2018_2022$CMI/1000000, valid_2018_2022$customer_minutes/1000000, 
+     xlab = "IEEE CMI (in millions)", 
+     ylab = "EAGLE-I CMI (in millions)", 
+     xlim = c(0, 5000),
+     ylim = c(0, 5000),
+     col = as.factor(valid_2018_2022$NERC),
+     main = "CMI comparison for all NERC regions", 
+     cex.main = 2, 
+     cex.lab = 1.5)
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+legend("topright", legend = unique(as.factor(valid_2018_2022$NERC)), 
+       col = unique(as.factor(valid_2018_2022$NERC)), pch = 1, title = "NERC Regions")
 
-# Boxplot of Log(CMI) for IEEE vs. EAGLE-I
-boxplot(log(valid_comparison_data$CMI + 1), log(valid_comparison_data$customer_minutes + 1),
-        names = c("IEEE CMI", "EAGLE-I CMI"),
-        ylab = "Log(Customer Minutes Impact + 1)",
-        main = "Distribution of Log(CMI) Across Metrics",
-        las = 1, cex.axis = 0.8)
+boxplot(log(valid_2018_2022$CMI), log(valid_2018_2022$customer_minutes), 
+        names = c("IEEE", "EAGLE-I"), 
+        ylab = "Log (CMI)", 
+        las = 1)
 
 
-# 9. Visualization of Comparisons (Individual NERC Region) ----
-message("\n9. Generating visualizations for an individual NERC region (e.g., TRE)...")
 
-# Choose a NERC region for detailed comparison (e.g., "TRE")
-selected_nerc_region <- "TRE"
-target_nerc_data <- valid_comparison_data[valid_comparison_data$NERC == selected_nerc_region, ]
 
-if (nrow(target_nerc_data) == 0) {
-  message(paste0("No data found for NERC region: ", selected_nerc_region, ". Skipping individual NERC plots."))
-} else {
-  message(paste0("  Analysis for NERC region: ", selected_nerc_region))
-  
-  # (CI vs. Daily Max)
-  message(paste0("    Correlations for ", selected_nerc_region, " (CI vs. Daily Max):"))
-  message(paste0("      Pearson: ", round(cor(target_nerc_data$CI, target_nerc_data$max_customer, use = "pairwise.complete.obs"), 3)))
-  message(paste0("      Spearman: ", round(cor(target_nerc_data$CI, target_nerc_data$max_customer, method = "spearman", use = "pairwise.complete.obs"), 3)))
-  plot(target_nerc_data$CI / 1000, target_nerc_data$max_customer / 1000,
-       xlab = "IEEE CI (in thousands)",
-       ylab = "EAGLE-I Daily Max CI (in thousands)",
-       xlim = c(0, max(target_nerc_data$CI, target_nerc_data$max_customer, na.rm = TRUE) / 1000),
-       ylim = c(0, max(target_nerc_data$CI, target_nerc_data$max_customer, na.rm = TRUE) / 1000),
-       col = target_nerc_data$year_factor,
-       main = paste0("CI Comparison: IEEE vs. EAGLE-I Daily Max (", selected_nerc_region, ")"),
-       pch = 19, cex = 0.8)
-  abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-  legend("topleft", legend = levels(target_nerc_data$year_factor),
-         col = unique(target_nerc_data$year_factor), pch = 19, title = "Years",
-         cex = 0.7, bty = "n")
-  boxplot(log(target_nerc_data$CI + 1), log(target_nerc_data$max_customer + 1),
-          names = c("IEEE CI", "EAGLE-I Daily Max CI"),
-          ylab = "Log(Customer Impact + 1)",
-          main = paste0("Log(CI) Distribution (", selected_nerc_region, ")"),
-          las = 1, cex.axis = 0.8)
-  
-  # (CI vs. Sum Positive Diff)
-  message(paste0("    Correlations for ", selected_nerc_region, " (CI vs. Sum Positive Diff):"))
-  message(paste0("      Pearson: ", round(cor(target_nerc_data$CI, target_nerc_data$daily_ci, use = "pairwise.complete.obs"), 3)))
-  message(paste0("      Spearman: ", round(cor(target_nerc_data$CI, target_nerc_data$daily_ci, method = "spearman", use = "pairwise.complete.obs"), 3)))
-  plot(target_nerc_data$CI / 1000, target_nerc_data$daily_ci / 1000,
-       xlab = "IEEE CI (in thousands)",
-       ylab = "EAGLE-I Sum of Positive Diff CI (in thousands)",
-       xlim = c(0, max(target_nerc_data$CI, target_nerc_data$daily_ci, na.rm = TRUE) / 1000),
-       ylim = c(0, max(target_nerc_data$CI, target_nerc_data$daily_ci, na.rm = TRUE) / 1000),
-       col = target_nerc_data$year_factor,
-       main = paste0("CI Comparison: IEEE vs. EAGLE-I Sum Positive Diff (", selected_nerc_region, ")"),
-       pch = 19, cex = 0.8)
-  abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-  legend("topleft", legend = levels(target_nerc_data$year_factor),
-         col = unique(target_nerc_data$year_factor), pch = 19, title = "Years",
-         cex = 0.7, bty = "n")
-  
-  # (CI vs. Moving Avg)
-  message(paste0("    Correlations for ", selected_nerc_region, " (CI vs. Moving Avg):"))
-  message(paste0("      Pearson: ", round(cor(target_nerc_data$CI, target_nerc_data$daily_ci_3day_avg, use = "pairwise.complete.obs"), 3)))
-  message(paste0("      Spearman: ", round(cor(target_nerc_data$CI, target_nerc_data$daily_ci_3day_avg, method = "spearman", use = "pairwise.complete.obs"), 3)))
-  plot(target_nerc_data$CI / 1000, target_nerc_data$daily_ci_3day_avg / 1000,
-       xlab = "IEEE CI (in thousands)",
-       ylab = "EAGLE-I 3-day Moving Average CI (in thousands)",
-       xlim = c(0, max(target_nerc_data$CI, target_nerc_data$daily_ci_3day_avg, na.rm = TRUE) / 1000),
-       ylim = c(0, max(target_nerc_data$CI, target_nerc_data$daily_ci_3day_avg, na.rm = TRUE) / 1000),
-       col = target_nerc_data$year_factor,
-       main = paste0("CI Comparison: IEEE vs. EAGLE-I 3-day MA (", selected_nerc_region, ")"),
-       pch = 19, cex = 0.8)
-  abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-  legend("topleft", legend = levels(target_nerc_data$year_factor),
-         col = unique(target_nerc_data$year_factor), pch = 19, title = "Years",
-         cex = 0.7, bty = "n")
-  
-  # (IEEE CI Moving Avg vs. EAGLE-I Moving Avg)
-  message(paste0("    Correlations for ", selected_nerc_region, " (IEEE MA vs. EAGLE-I MA):"))
-  message(paste0("      Pearson: ", round(cor(target_nerc_data$CI_moving, target_nerc_data$daily_ci_3day_avg, use = "pairwise.complete.obs"), 3)))
-  message(paste0("      Spearman: ", round(cor(target_nerc_data$CI_moving, target_nerc_data$daily_ci_3day_avg, method = "spearman", use = "pairwise.complete.obs"), 3)))
-  plot(target_nerc_data$CI_moving / 1000, target_nerc_data$daily_ci_3day_avg / 1000,
-       xlab = "IEEE 3-day Moving Average CI (in thousands)",
-       ylab = "EAGLE-I 3-day Moving Average CI (in thousands)",
-       xlim = c(0, max(target_nerc_data$CI_moving, target_nerc_data$daily_ci_3day_avg, na.rm = TRUE) / 1000),
-       ylim = c(0, max(target_nerc_data$CI_moving, target_nerc_data$daily_ci_3day_avg, na.rm = TRUE) / 1000),
-       col = target_nerc_data$year_factor,
-       main = paste0("CI Comparison: IEEE 3-day MA vs. EAGLE-I 3-day MA (", selected_nerc_region, ")"),
-       pch = 19, cex = 0.8)
-  abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-  legend("topleft", legend = levels(target_nerc_data$year_factor),
-         col = unique(target_nerc_data$year_factor), pch = 19, title = "Years",
-         cex = 0.7, bty = "n")
-  
-  # (CMI comparisons)
-  message(paste0("    Correlations for ", selected_nerc_region, " (CMI comparison):"))
-  message(paste0("      Pearson: ", round(cor(target_nerc_data$CMI, target_nerc_data$customer_minutes, use = "pairwise.complete.obs"), 3)))
-  message(paste0("      Spearman: ", round(cor(target_nerc_data$CMI, target_nerc_data$customer_minutes, method = "spearman", use = "pairwise.complete.obs"), 3)))
-  plot(target_nerc_data$CMI / 1000000, target_nerc_data$customer_minutes / 1000000,
-       xlab = "IEEE CMI (in millions)",
-       ylab = "EAGLE-I CMI (in millions)",
-       xlim = c(0, max(target_nerc_data$CMI, target_nerc_data$customer_minutes, na.rm = TRUE) / 1000000),
-       ylim = c(0, max(target_nerc_data$CMI, target_nerc_data$customer_minutes, na.rm = TRUE) / 1000000),
-       col = target_nerc_data$year_factor,
-       main = paste0("CMI Comparison: IEEE vs. EAGLE-I (", selected_nerc_region, ")"),
-       pch = 19, cex = 0.8)
-  abline(a = 0, b = 1, col = "red", lty = 2, lwd = 1.5)
-  legend("topleft", legend = levels(target_nerc_data$year_factor),
-         col = unique(target_nerc_data$year_factor), pch = 19, title = "Years",
-         cex = 0.7, bty = "n")
-  boxplot(log(target_nerc_data$CMI + 1), log(target_nerc_data$customer_minutes + 1),
-          names = c("IEEE CMI", "EAGLE-I CMI"),
-          ylab = "Log(Customer Minutes Impact + 1)",
-          main = paste0("Log(CMI) Distribution (", selected_nerc_region, ")"),
-          las = 1, cex.axis = 0.8)
-}
 
-message("\nScript execution complete.")
+## Comparison for each NERC region
+nerc <- "TRE"
+target <- valid_2018_2022[valid_2018_2022$NERC == nerc, ]
+
+
+# (CI v.s daily max)
+cor(target$CI, target$max_customer)
+cor(target$CI, target$max_customer, method= "spearman")
+
+
+plot(target$CI/1000, target$max_customer/1000, 
+     xlab = "IEEE CI (in thousands)", 
+     ylab = "Daily max (in thousands)", 
+     xlim = c(0, 1200),
+     ylim = c(0, 1200),
+     col = valid_2018_2022$year,
+     main = nerc)
+
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+
+legend("topright", legend = unique(valid_2018_2022$year), 
+       col = unique(valid_2018_2022$year), pch = 1, title = "Years")
+
+boxplot(log(target$CI), log(target$max_customer), 
+        names = c("IEEE", "EAGLE-I"), 
+        ylab = "Log (CI)", 
+        las = 1)
+
+# (CI v.s. sum positive diff)
+cor(target$CI, target$daily_ci)
+cor(target$CI, target$daily_ci, method = "spearman")
+
+plot(target$CI/1000, target$daily_ci/1000, 
+     xlab = "IEEE CI (in thousands)", 
+     ylab = "Sum_positive_diff (in thousands)", 
+     # xlim = c(0, 1200),
+     # ylim = c(0, 1200),
+     col = valid_2018_2022$year,
+     main = nerc)
+
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+
+legend("topright", legend = unique(valid_2018_2022$year), 
+       col = unique(valid_2018_2022$year), pch = 1, title = "Years")
+
+boxplot(log(target$CI), log(target$daily_ci), 
+        names = c("IEEE", "EAGLE-I"), 
+        ylab = "Log (CI)", 
+        las = 1)
+
+# (CI v.s. moving avg)
+cor(target$CI, target$daily_ci_3day_avg)
+cor(target$CI, target$daily_ci_3day_avg, method = "spearman")
+
+plot(target$CI/1000, target$daily_ci_3day_avg/1000, 
+     xlab = "IEEE CI (in thousands)", 
+     ylab = "Moving avg (in thousands)", 
+     # xlim = c(0, 750),
+     # ylim = c(0, 750),
+     col = valid_2018_2022$year,
+     main = nerc)
+
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+
+legend("topright", legend = unique(valid_2018_2022$year), 
+       col = unique(valid_2018_2022$year), pch = 1, title = "Years")
+
+boxplot(log(target$CI), log(target$daily_ci_3day_avg), 
+        names = c("IEEE", "EAGLE-I"), 
+        ylab = "Log (CI)", 
+        las = 1)
+
+# (IEE CI moving v.s. EAGLEI-I moving avg)
+cor(target$CI_moving, target$daily_ci_3day_avg)
+cor(target$CI_moving, target$daily_ci_3day_avg, method = "spearman")
+
+plot(target$CI_moving/1000, target$daily_ci_3day_avg/1000, 
+     xlab = "IEEE CI_moving (in thousands)", 
+     ylab = "Moving avg (in thousands)", 
+     # xlim = c(0, 550),
+     # ylim = c(0, 550),
+     col = valid_2018_2022$year,
+     main = nerc)
+
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+
+legend("topleft", legend = unique(valid_2018_2022$year), 
+       col = unique(valid_2018_2022$year), pch = 1, title = "Years")
+
+boxplot(log(target$CI), log(target$daily_ci_3day_avg), 
+        names = c("IEEE", "EAGLE-I"), 
+        ylab = "Log (CI)", 
+        las = 1)
+
+# Calculate correlation coefficient and generate scatterplot for each NERC region for CMI
+target <- valid_2018_2022[valid_2018_2022$NERC == "TRE", ]
+cor(target$CMI, target$customer_minutes)
+plot(target$CMI/1000000, target$customer_minutes/1000000, 
+     xlab = "IEEE CMI (in millions)", 
+     ylab = "EAGLE-I CMI (in millions)", 
+     # xlim = c(0, 550),
+     # ylim = c(0, 550),
+     col = valid_2018_2022$year,
+     main = "TRE")
+
+abline(a = 0, b = 1,
+       col = "red",        # Set line color (e.g., red)
+       lty = 2,            # Set line type (e.g., 2 for dashed)
+       lwd = 1.5)          # Set line width (optional)
+
+legend("topright", legend = unique(valid_2018_2022$year), 
+       col = unique(valid_2018_2022$year), pch = 1, title = "Years")
+
+boxplot(log(target$CMI), log(target$customer_minutes), 
+        names = c("IEEE", "EAGLE-I"), 
+        ylab = "Log (CMI)", 
+        las = 1)

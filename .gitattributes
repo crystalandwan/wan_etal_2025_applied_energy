@@ -1,1 +1,2 @@
 data/County_NERC_shapefile/* filter=lfs diff=lfs merge=lfs -text
+data/EAGLE-I/* filter=lfs diff=lfs merge=lfs -text

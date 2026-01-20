@@ -36,6 +36,9 @@ Clone this repository to get access to the R codes used to analyze the IEEE and 
 |Script Name | Description |
 | --- | --- |
 |Aggregate_eaglei_from_15min_to_daily.R | Utility functions to aggregate 15-minutes EAGLE-I outage data to daily |
+|Customer_coverage_comparisons.R | Compare utility customer coverage between the two outage datasets|
+|Comparisons_between_ieee_and_eaglei | Compare IEEE and EAGLE-I outage dataset based on statistical analysis|
+|CONUS_level_reliability_metrics_calculation.R | Calculate reliability metrics for the two datasets at the CONUS-level|
 
 
 ## Reproduce my figures
@@ -43,5 +46,7 @@ Use the scripts found in the `figures` directory to reproduce the figures used i
 
 | Figure Number(s) | Script Name | Description |
 | --- | --- | --- |
-| 2, 3, 4, 5 | `Average_by_NERC.ipynb` | Plot extreme thermal event characteristics across different NERC subregions based on MWA and MWP spatial aggregation methods, including event intensity, event frequency, event duration, and event spatial 
+| 3 | `Rolling_reliability_time_series_plot.ipynb` | Plot time-series reliability metrics for the two outage datasets|
+|4, 5, 6| `Scatter_plots.ipynb` | Generate scatter plots to compare customer interrupted (CI) values between the two outage datasets|
+|7|`Case_event_comparisons.ipynb` | Compare the two outage datasets using case studies|
 

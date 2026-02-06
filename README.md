@@ -37,6 +37,22 @@ Clone this repository to get access to the R codes used to analyze the IEEE and 
 |Comparisons_between_ieee_and_eaglei | Compare IEEE and EAGLE-I outage dataset based on statistical analysis|
 |CONUS_level_reliability_metrics_calculation.R | Calculate reliability metrics for the two datasets at the CONUS-level|
 
+## Execution pipeline
+Follow this sequence to ensure data dependencies are met:
+
+Customer_coverage_comparisons.R
+
+⬇️
+
+Comparisons_between_ieee_and_eaglei.R
+
+⬇️
+
+CONUS_level_reliability_metics_calculation.R
+
+⬇️
+
+Figure Generation Scripts
 
 ## Reproduce my figures
 Use the scripts found in the `scripts/figure_generation` directory to reproduce the figures used in this publication.

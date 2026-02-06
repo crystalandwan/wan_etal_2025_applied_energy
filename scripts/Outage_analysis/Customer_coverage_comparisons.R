@@ -41,6 +41,20 @@ if (!file.exists(config_path)) {
 }
 source(config_path)
 
+# Validate all essential input paths defined in config.R ---
+if (!file.exists(eaglei_coverage_path)) {
+  stop(paste("Error: EAGLE-I coverage history file not found at:", eaglei_coverage_path))
+}
+if (!file.exists(county_pop_data_path)) {
+  stop(paste("Error: County population data file not found at:", county_pop_data_path))
+}
+if (!file.exists(counties_nerc_shp_path)) {
+  stop(paste("Error: Counties to NERC subregion shapefile not found at:", counties_nerc_shp_path))
+}
+if (!file.exists(ieee_customers_path)) {
+  stop(paste("Error: IEEE customer counts file not found at:", ieee_customers_path))
+}
+
 # --- Start of Main Script Logic ---
 
 # 1. Load and Prepare EAGLE-I Coverage Data ----

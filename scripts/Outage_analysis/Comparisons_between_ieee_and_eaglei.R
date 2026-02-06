@@ -68,6 +68,9 @@ source(eaglei_agg_script_path)
 message("1. Preparing geographic and time zone data...")
 
 # Read in county-NERC mapping shapefile
+if (!file.exists(counties_nerc_shp_path)) {
+  stop(paste("Error: Primary shapefile (counties_NERC) not found at:", counties_nerc_shp_path))
+}
 counties_NERCs <- st_read(counties_nerc_shp_path) %>%
   mutate(
     NERC = case_when(
@@ -88,6 +91,9 @@ counties_NERCs <- st_read(counties_nerc_shp_path) %>%
 counties_NERCs <- st_centroid(counties_NERCs)
 
 # Read in time zone shapefile
+if (!file.exists(time_zone_shp_path)) {
+  stop(paste("Error: Primary shapefile (time_zone) not found at:", time_zone_shp_path))
+}
 time_zone <- st_read(time_zone_shp_path) %>%
   st_transform(crs = st_crs(counties_NERCs)) %>% # Transform for consistent CRS
   st_make_valid() # Fix any invalid geometries
@@ -110,6 +116,9 @@ counties_NERCs <- st_drop_geometry(counties_NERCs)
 message("2. Loading and pre-processing raw EAGLE-I data (15-min interval)...")
 
 # Get list of EAGLE-I data files
+if (!dir.exists(eaglei_raw_data_dir)) {
+  stop(paste("Error: EAGLE-I raw data directory not found at:", eaglei_raw_data_dir))
+}
 eaglei_file_paths <- list.files(
   path = eaglei_raw_data_dir,
   pattern = paste0("^", "eaglei_outages_", "(\\d{4})", ".csv$"),
@@ -205,6 +214,9 @@ eaglei_NERC <- eaglei_daily[, .(max_customer = sum(max_customer, na.rm = TRUE),
 message("4. Loading and preparing IEEE dataset...")
 
 # Read in IEEE combined outage data
+if (!file.exists(ieee_combined_path)) {
+  stop(paste("Error: IEEE combined outage data file not found at:", ieee_combined_path))
+}
 IEEE_combined <- fread(ieee_combined_path)
 
 # Rename "SPP RE" to "SPP" for consistency
@@ -229,6 +241,9 @@ IEEE_combined_NERC <- IEEE_combined_NERC[!is.na(IEEE_combined_NERC$CI_moving), ]
 IEEE_combined_NERC$year <- year(IEEE_combined_NERC$Date)
 
 # Read in IEEE customer data
+if (!file.exists(ieee_customers_path)) {
+  stop(paste("Error: IEEE customer count data file not found at:", ieee_customers_path))
+}
 IEEE_customer <- fread(ieee_customers_path)
 
 # Rename "SPP RE" to "SPP" for consistency

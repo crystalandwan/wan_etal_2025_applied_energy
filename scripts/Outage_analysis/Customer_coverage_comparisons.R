@@ -185,8 +185,8 @@ coverage_NERC <- county_results_dt[, .(
   max_covered = sum(county_max_covered, na.rm = TRUE)
 ), by = c("year", "NERC")]
 
-# # Write out the EAGLE-I coverage by NERC region
-# fwrite(coverage_NERC, eaglei_coverage_nerc_path)
+# Write out the EAGLE-I coverage by NERC region
+fwrite(coverage_NERC, eaglei_coverage_nerc_path)
 
 # 6. Load and Prepare IEEE Customer Data ----
 message("Loading and preparing IEEE customer data...")

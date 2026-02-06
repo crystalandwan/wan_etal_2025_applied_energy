@@ -90,6 +90,7 @@ MERGED_FILTER_DATE_END <- "2022-11-11"
 # Other Constants
 CI_PERCENT_THRESHOLD <- 0.25 # Select from various threshold scenarios including 0.25, 0.5, 1, and 2
 MOVING_AVG_DAY <- 3
+PERCENTAGE_CONVERSION <- 100 # Convert value to percentage
 THOUSAND_UNIT <- 1000 # Convert value to thousands
 MILLION_UNIT <- 1000000 # Convert value to millions
 BREAKS = c(0, 0.25, 0.5, 1, 2, 5, 10, 20, 100, 200) # For histogram breaks
@@ -248,8 +249,8 @@ eaglei_NERC <- eaglei_daily[, .(max_customer = sum(max_customer, na.rm = TRUE),
                                 customer_minutes = sum(total_customer_minutes, na.rm = TRUE)),
                             by = .(NERC, Date)]
 
-# # Write out the NERC-level EAGLE-I with time adjusted to local time
-# fwrite(eaglei_NERC, eaglei_nerc_time_adjusted_path)
+# Write out the NERC-level EAGLE-I with time adjusted to local time
+fwrite(eaglei_NERC, eaglei_nerc_time_adjusted_path)
 
 
 # 4. Load and Prepare IEEE Dataset ----
@@ -306,7 +307,7 @@ message("5. Merging EAGLE-I and IEEE datasets for comparison...")
 Merged <- merge(IEEE_combined_NERC, eaglei_combined_NERC, by = c("NERC", "Date"), all.x = TRUE, all.y = TRUE)
 
 # Calculate the customers impacted percentage
-Merged$CI_per <- Merged$CI / Merged$customers_IEEE * 100
+Merged$CI_per <- Merged$CI / Merged$customers_IEEE * PERCENTAGE_CONVERSION
 
 # Extract records with overlapping time period
 Merged_overlap <- Merged[Merged$Date >= MERGED_FILTER_DATE_START & Merged$Date <= MERGED_FILTER_DATE_END, ]
